@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
 
         self._build_actions()
         self._build_toolbar()
-        self._build_statusbar()
+        self._build_zoom_bar()
         self._build_menus()
         self._apply_theme(config.get_dark_mode())
         self.sidebar.setVisible(config.get_sidebar_visible())
@@ -438,21 +438,24 @@ class MainWindow(QMainWindow):
             label = action.text().replace("&&", "&").replace("...", "")
             action.setToolTip(f"{label} ({shortcut})" if shortcut else label)
 
-    def _build_statusbar(self) -> None:
-        """Bottom-left zoom controls and page jump (Adobe-style); the combined
-        page/zoom summary label stays on the right as before."""
-        bar = self.statusBar()
+    def _build_zoom_bar(self) -> None:
+        """Bottom-left zoom controls and page jump (Adobe-style).
+
+        A toolbar rather than status-bar widgets: QStatusBar hides non-permanent
+        widgets whenever a temporary showMessage() is displayed, and the app
+        shows such messages after most actions.
+        """
+        bar = QToolBar("Zoom", self)
+        bar.setMovable(False)
+        bar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.addToolBar(Qt.BottomToolBarArea, bar)
 
         def small_button(text: str, action: QAction) -> QToolButton:
+            # A compact stand-in for the action (its own text is too wide here).
             btn = QToolButton(self)
             btn.setText(text)
             btn.setToolTip(action.toolTip())
             btn.clicked.connect(action.trigger)
-            return btn
-
-        def action_button(action: QAction) -> QToolButton:
-            btn = QToolButton(self)
-            btn.setDefaultAction(action)
             return btn
 
         self.zoom_edit = QLineEdit(self)
@@ -470,31 +473,32 @@ class MainWindow(QMainWindow):
 
         btn_zoom_out = small_button("−", self.act_zoom_out)
         btn_zoom_in = small_button("+", self.act_zoom_in)
-        btn_fit = action_button(self.act_fit)
-        btn_fit_page = action_button(self.act_fit_page)
-        btn_actual = action_button(self.act_actual_size)
 
-        for widget in (
-            btn_zoom_out, self.zoom_edit, btn_zoom_in,
-            btn_fit, btn_fit_page, btn_actual,
-            QLabel("   Page", self), self.page_edit, self.page_count_label,
-        ):
-            bar.addWidget(widget)
+        bar.addWidget(btn_zoom_out)
+        bar.addWidget(self.zoom_edit)
+        bar.addWidget(btn_zoom_in)
+        bar.addSeparator()
+        bar.addAction(self.act_fit)
+        bar.addAction(self.act_fit_page)
+        bar.addAction(self.act_actual_size)
+        bar.addSeparator()
+        bar.addWidget(QLabel(" Page ", self))
+        bar.addWidget(self.page_edit)
+        bar.addWidget(self.page_count_label)
 
-        # Widgets that only make sense with a document open.
-        self._doc_widgets = [
-            btn_zoom_out, self.zoom_edit, btn_zoom_in,
-            btn_fit, btn_fit_page, btn_actual, self.page_edit,
-        ]
+        # Input widgets that only make sense with a document open. The action
+        # buttons stay enabled and no-op like their toolbar twins.
+        self._doc_widgets = [btn_zoom_out, self.zoom_edit, btn_zoom_in, self.page_edit]
 
         self.status_label = QLabel("No document")
-        bar.addPermanentWidget(self.status_label)
+        self.statusBar().addPermanentWidget(self.status_label)
 
     def _on_zoom_edited(self) -> None:
         tab = self.current_tab()
         if tab is None:
             return
-        text = self.zoom_edit.text().strip().rstrip("%").strip()
+        # Accept comma decimals ("62,5") — float() only takes a dot.
+        text = self.zoom_edit.text().strip().rstrip("%").strip().replace(",", ".")
         try:
             percent = float(text)
         except ValueError:
@@ -503,6 +507,7 @@ class MainWindow(QMainWindow):
             tab.set_zoom_percent(percent)
         # Hand focus back to the document and normalise the box: clamped or
         # invalid input may not change the zoom, so `changed` may never fire.
+        self.zoom_edit.setModified(False)
         tab.view.setFocus()
         self._update_status()
 
@@ -516,6 +521,7 @@ class MainWindow(QMainWindow):
             page = 0
         if page >= 1:
             tab.goto_page(min(page, tab.doc.page_count) - 1)
+        self.page_edit.setModified(False)
         tab.view.setFocus()
         self._update_status()
 
@@ -736,24 +742,23 @@ class MainWindow(QMainWindow):
         self._update_zoom_page_widgets(tab)
 
     def _update_zoom_page_widgets(self, tab: DocumentTab | None) -> None:
-        """Sync the status-bar zoom/page controls with the active tab.
+        """Sync the zoom-bar controls with the active tab.
 
-        Boxes the user is currently typing in are left alone so a scroll or
-        background render doesn't overwrite their input.
+        Boxes the user has typed into (isModified — merely having focus doesn't
+        block updates) are left alone so a render doesn't overwrite their input;
+        setText resets the modified flag once the value is applied.
         """
         has_doc = tab is not None and tab.doc.is_open
         for widget in self._doc_widgets:
             widget.setEnabled(has_doc)
         if tab is None or not tab.doc.is_open:
-            if not self.zoom_edit.hasFocus():
-                self.zoom_edit.clear()
-            if not self.page_edit.hasFocus():
-                self.page_edit.clear()
+            self.zoom_edit.clear()
+            self.page_edit.clear()
             self.page_count_label.setText("/ 0")
             return
-        if not self.zoom_edit.hasFocus():
+        if not self.zoom_edit.isModified():
             self.zoom_edit.setText(f"{int(round(tab.zoom * 100))}%")
-        if not self.page_edit.hasFocus():
+        if not self.page_edit.isModified():
             self.page_edit.setText(str(tab.current_page + 1))
         self.page_count_label.setText(f"/ {tab.doc.page_count}")
 

@@ -9,6 +9,7 @@ from PySide6.QtCore import QEvent, QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
+    QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -29,9 +30,11 @@ from highlight_item import HighlightItem
 from signature_item import SignatureItem
 from text_item import TextItem
 
-ZOOM_MIN = 0.25
-ZOOM_MAX = 5.0
 ZOOM_STEP = 1.25
+# Space left around a fitted page. Also covers the vertical scrollbar: fit
+# zooms are computed from maximumViewportSize() (which ignores scrollbars) so
+# they stay stable when a fit toggles a scrollbar on or off.
+FIT_MARGIN = 24.0
 PAGE_GAP = 12.0  # scene-pixel gap between stacked pages
 SEARCH_CHUNK_PAGES = 50  # pages searched per event-loop slice (keeps UI responsive)
 
@@ -54,6 +57,10 @@ class DocumentTab(QWidget):
         self.zoom = config.get_zoom_level()
         self._zoom_mode = config.get_zoom_mode()
         self._did_initial_fit = False
+        # Zoom the current scene layout was built at. self.zoom may run ahead
+        # of it briefly inside _apply_zoom; render_all_pages uses the pair to
+        # re-anchor overlays across the zoom change, then re-syncs it.
+        self._layout_zoom = self.zoom
         self._dpr = 1.0
         self._current_page = 0
         # Page layout is computed cheaply from page sizes; pixmaps are rendered
@@ -118,7 +125,9 @@ class DocumentTab(QWidget):
         layout.addWidget(self.view)
 
         self.doc.load(path)
-        self.render_all_pages()
+        # The first layout runs from showEvent -> _apply_zoom_mode once the
+        # viewport has a real size; rendering here at the stored zoom would
+        # just be thrown away by the initial fit.
 
     # ----- find bar ----------------------------------------------------------
     def _build_find_bar(self) -> QWidget:
@@ -290,6 +299,10 @@ class DocumentTab(QWidget):
             and event.type() == QEvent.Resize
             and self._did_initial_fit
             and self._zoom_mode != "custom"
+            # The find bar borrows viewport height while open; refitting for
+            # that would rescale the document mid-search. Hiding the bar fires
+            # another Resize, so the refit catches up then.
+            and not self.find_bar.isVisible()
         ):
             self._refit_timer.start()
         return super().eventFilter(obj, event)
@@ -311,7 +324,7 @@ class DocumentTab(QWidget):
         if self.doc.is_open:
             return (
                 f"Page {self._current_page + 1} / {self.doc.page_count}"
-                f"    {int(self.zoom * 100)}%"
+                f"    {int(round(self.zoom * 100))}%"
             )
         return "No document"
 
@@ -329,14 +342,22 @@ class DocumentTab(QWidget):
         # Detach the signature and texts before clearing so Qt doesn't delete the C++ objects
         # out from under us; we re-add the same items afterwards.
         keep_sig = self._signature
-        if keep_sig is not None:
-            self.scene.removeItem(keep_sig)
         keep_texts = self._texts
-        for txt in keep_texts:
-            self.scene.removeItem(txt)
         keep_highlights = self._highlights
-        for hl in keep_highlights:
-            self.scene.removeItem(hl)
+        keep_items: list[QGraphicsItem] = []
+        if keep_sig is not None:
+            keep_items.append(keep_sig)
+        keep_items.extend(keep_texts)
+        keep_items.extend(keep_highlights)
+        # Anchor each overlay to its page in PDF points (captured against the
+        # outgoing layout) so a zoom change re-places it at the same spot on
+        # the page instead of leaving it at stale scene coordinates.
+        old_zoom = self._layout_zoom
+        overlay_anchors = [
+            (item, self._overlay_anchor(item, old_zoom)) for item in keep_items
+        ]
+        for item in keep_items:
+            self.scene.removeItem(item)
 
         self.scene.clear()
         self._page_sizes = []
@@ -384,6 +405,11 @@ class DocumentTab(QWidget):
         for hl in keep_highlights:
             self.scene.addItem(hl)
             self._highlights.append(hl)
+
+        scale_ratio = (self.zoom / old_zoom) if old_zoom > 0 else 1.0
+        for item, anchor in overlay_anchors:
+            self._restore_overlay_anchor(item, anchor, scale_ratio)
+        self._layout_zoom = self.zoom
 
         if preserve_scroll:
             v_bar.setValue(int(v_ratio * v_bar.maximum()))
@@ -435,6 +461,46 @@ class DocumentTab(QWidget):
         x, y = self._page_pos[index]
         w, h = self._page_sizes[index]
         return QRectF(x, y, w, h)
+
+    @staticmethod
+    def _overlay_scene_rect(item) -> QRectF:
+        """Content rect of an overlay in scene coords (no handle padding)."""
+        getter = getattr(item, "content_scene_rect", None)
+        return getter() if getter is not None else item.sceneBoundingRect()
+
+    def _overlay_anchor(self, item, layout_zoom: float) -> tuple[int, float, float] | None:
+        """(page index, centre offset within that page in PDF points), or None.
+
+        Must be called while the layout that ``layout_zoom`` produced is still
+        current; None when the overlay isn't over a page.
+        """
+        if layout_zoom <= 0:
+            return None
+        rect = self._overlay_scene_rect(item)
+        page = self._page_for_rect(rect)
+        if page < 0:
+            return None
+        px, py = self._page_pos[page]
+        centre = rect.center()
+        return (page, (centre.x() - px) / layout_zoom, (centre.y() - py) / layout_zoom)
+
+    def _restore_overlay_anchor(
+        self,
+        item,
+        anchor: tuple[int, float, float] | None,
+        scale_ratio: float,
+    ) -> None:
+        """Re-place (and re-scale) an overlay at its page anchor after a re-layout."""
+        if anchor is None:
+            return
+        page, pt_x, pt_y = anchor
+        if page >= len(self._page_pos):
+            return
+        if abs(scale_ratio - 1.0) >= 1e-9:
+            item.setScale(item.scale() * scale_ratio)
+        px, py = self._page_pos[page]
+        centre = self._overlay_scene_rect(item).center()
+        item.moveBy(px + pt_x * self.zoom - centre.x(), py + pt_y * self.zoom - centre.y())
 
     def _on_scroll(self, _value: int = 0) -> None:
         self._render_visible()
@@ -585,6 +651,8 @@ class DocumentTab(QWidget):
         self.find_status.clear()
         self._current_page = min(self._current_page, self.doc.page_count - 1)
         self.render_all_pages()
+        # Page geometry changed; a fit mode may need a different zoom now.
+        self._refit_timer.start()
         self.structure_changed.emit()
         return True
 
@@ -605,6 +673,8 @@ class DocumentTab(QWidget):
         self._clear_matches()
         self.find_status.clear()
         self.render_all_pages(preserve_scroll=True)
+        # Page geometry changed; a fit mode may need a different zoom now.
+        self._refit_timer.start()
         self.structure_changed.emit()
         return True
 
@@ -623,6 +693,8 @@ class DocumentTab(QWidget):
         self._clear_matches()
         self.find_status.clear()
         self.render_all_pages(preserve_scroll=True)
+        # Page geometry changed; a fit mode may need a different zoom now.
+        self._refit_timer.start()
         self.structure_changed.emit()
         return True
 
@@ -641,46 +713,60 @@ class DocumentTab(QWidget):
 
     # ----- zoom --------------------------------------------------------------
     def zoom_in(self, anchor: QPoint | None = None) -> None:
-        if self._apply_zoom(self.zoom * ZOOM_STEP, anchor):
-            self._set_zoom_mode("custom")
+        self._apply_zoom(self.zoom * ZOOM_STEP, anchor, mode="custom")
 
     def zoom_out(self, anchor: QPoint | None = None) -> None:
-        if self._apply_zoom(self.zoom / ZOOM_STEP, anchor):
-            self._set_zoom_mode("custom")
+        self._apply_zoom(self.zoom / ZOOM_STEP, anchor, mode="custom")
 
     def zoom_actual(self) -> None:
         """Zoom to 100% (one PDF point per logical pixel)."""
-        self._apply_zoom(1.0)
-        self._set_zoom_mode("custom")
+        self._apply_zoom(1.0, mode="custom")
 
     def set_zoom_percent(self, percent: float) -> None:
-        """Zoom to ``percent``/100, e.g. from the status-bar zoom box."""
-        self._apply_zoom(percent / 100.0)
-        self._set_zoom_mode("custom")
+        """Zoom to ``percent``/100, e.g. from the zoom box."""
+        self._apply_zoom(percent / 100.0, mode="custom")
 
     def _set_zoom_mode(self, mode: str) -> None:
         """Record the zoom mode and persist mode + level for future documents."""
         self._zoom_mode = mode
-        config.set_zoom_mode(mode)
-        config.set_zoom_level(self.zoom)
+        config.set_zoom_pref(mode, self.zoom)
 
     def _apply_zoom_mode(self) -> None:
-        """Recompute the zoom for the remembered mode (initial show / resize)."""
-        if self._zoom_mode == "fit_width":
-            self.fit_width()
-        elif self._zoom_mode == "fit_page":
-            self.fit_page()
-        # "custom": the stored zoom level is already applied.
+        """Recompute the fit for the remembered mode (initial show / resize refit).
 
-    def _apply_zoom(self, value: float, anchor: QPoint | None = None) -> bool:
+        Passive: passes no mode to _apply_zoom, so it never persists — a window
+        resize must not overwrite a zoom choice the user made elsewhere.
+        """
+        if self._zoom_mode in ("fit_width", "fit_page"):
+            value = self._fit_zoom(self._zoom_mode)
+            if value is not None:
+                self._apply_zoom(value)
+        if not self._page_sizes and self.doc.is_open:
+            # First show with nothing laid out yet (custom mode, or a fit that
+            # matched the stored zoom exactly): do the initial layout now.
+            self.render_all_pages()
+
+    def _apply_zoom(
+        self,
+        value: float,
+        anchor: QPoint | None = None,
+        mode: str | None = None,
+    ) -> bool:
         """Set the zoom level. Returns True when the zoom actually changed.
 
         ``anchor`` is an optional viewport position (e.g. the mouse cursor during
         Ctrl+wheel) that should keep pointing at the same spot on the page after
         the zoom; without it the scroll position is preserved proportionally.
+
+        ``mode`` marks an explicit user zoom action: the mode and level are
+        recorded and persisted even when the zoom value itself doesn't change
+        (clicking Fit Width is a mode choice regardless). Passive recomputations
+        pass no mode and therefore never touch the persisted preference.
         """
-        value = max(ZOOM_MIN, min(ZOOM_MAX, value))
+        value = max(config.ZOOM_MIN, min(config.ZOOM_MAX, value))
         if abs(value - self.zoom) < 1e-6:
+            if mode is not None:
+                self._set_zoom_mode(mode)
             return False
 
         # Capture the document position under the anchor before re-layout:
@@ -714,28 +800,40 @@ class DocumentTab(QWidget):
                 scene_y + viewport.height() / 2.0 - view_y,
             )
             self._render_visible()
+        if mode is not None:
+            self._set_zoom_mode(mode)
         return True
 
-    def fit_width(self) -> None:
+    def _fit_zoom(self, mode: str) -> float | None:
+        """Zoom that fits the current page for ``mode``, or None if unknowable.
+
+        Computed from maximumViewportSize() — the viewport as if no scrollbars
+        were shown — so the result doesn't flip when a fit toggles a scrollbar
+        (a viewport-based value oscillates in that case). FIT_MARGIN reserves
+        the scrollbar's room.
+        """
         if not self.doc.is_open:
-            return
-        width_points, _ = self.doc.page_size_points(self._current_page)
-        viewport_width = self.view.viewport().width() - 24
-        if width_points > 0 and viewport_width > 0:
-            self._apply_zoom(viewport_width / width_points)
-            self._set_zoom_mode("fit_width")
+            return None
+        width_points, height_points = self.doc.page_size_points(self._current_page)
+        size = self.view.maximumViewportSize()
+        avail_w = size.width() - FIT_MARGIN
+        avail_h = size.height() - FIT_MARGIN
+        if width_points <= 0 or height_points <= 0 or avail_w <= 0 or avail_h <= 0:
+            return None
+        if mode == "fit_width":
+            return avail_w / width_points
+        return min(avail_w / width_points, avail_h / height_points)
+
+    def fit_width(self) -> None:
+        value = self._fit_zoom("fit_width")
+        if value is not None:
+            self._apply_zoom(value, mode="fit_width")
 
     def fit_page(self) -> None:
         """Fit the whole current page (width and height) inside the viewport."""
-        if not self.doc.is_open:
-            return
-        width_points, height_points = self.doc.page_size_points(self._current_page)
-        viewport = self.view.viewport()
-        avail_w = viewport.width() - 24
-        avail_h = viewport.height() - 24
-        if min(width_points, height_points) > 0 and min(avail_w, avail_h) > 0:
-            self._apply_zoom(min(avail_w / width_points, avail_h / height_points))
-            self._set_zoom_mode("fit_page")
+        value = self._fit_zoom("fit_page")
+        if value is not None:
+            self._apply_zoom(value, mode="fit_page")
 
     # ----- signature ---------------------------------------------------------
     def add_signature(self, sig_path: str) -> bool:

@@ -26,6 +26,10 @@ _ZOOM_MODE = "ui/zoom_mode"
 _ZOOM_LEVEL = "ui/zoom_level"
 
 ZOOM_MODES = ("fit_width", "fit_page", "custom")
+# Zoom bounds live here (not in the view code) so the persisted level is
+# clamped to the same range the viewer enforces.
+ZOOM_MIN = 0.25
+ZOOM_MAX = 5.0
 
 
 _migrated = False
@@ -130,6 +134,9 @@ def set_sidebar_visible(visible: bool) -> None:
     _settings().setValue(_SIDEBAR_VISIBLE, bool(visible))
 
 
+_zoom_pref_cache: tuple[str, float] | None = None
+
+
 def get_zoom_mode() -> str:
     """Last-used zoom mode; documents open in this mode.
 
@@ -140,22 +147,31 @@ def get_zoom_mode() -> str:
     return value if value in ZOOM_MODES else "fit_width"
 
 
-def set_zoom_mode(mode: str) -> None:
-    if mode in ZOOM_MODES:
-        _settings().setValue(_ZOOM_MODE, mode)
-
-
 def get_zoom_level() -> float:
     """Last-used zoom factor (1.0 = 100%), used when the mode is "custom"."""
     try:
         value = float(str(_settings().value(_ZOOM_LEVEL, 1.5)))
     except (TypeError, ValueError):
         value = 1.5
-    return max(0.25, min(5.0, value))
+    return max(ZOOM_MIN, min(ZOOM_MAX, value))
 
 
-def set_zoom_level(zoom: float) -> None:
-    _settings().setValue(_ZOOM_LEVEL, float(zoom))
+def set_zoom_pref(mode: str, level: float) -> None:
+    """Persist zoom mode and level together, skipping the write when unchanged.
+
+    The skip matters because this runs on every zoom action, including each
+    Ctrl+wheel notch: without it every notch costs two settings-store syncs.
+    """
+    global _zoom_pref_cache
+    if mode not in ZOOM_MODES:
+        return
+    pref = (mode, float(level))
+    if pref == _zoom_pref_cache:
+        return
+    settings = _settings()
+    settings.setValue(_ZOOM_MODE, mode)
+    settings.setValue(_ZOOM_LEVEL, pref[1])
+    _zoom_pref_cache = pref
 
 
 def cache_dir() -> str:
