@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -194,6 +195,7 @@ class MainWindow(QMainWindow):
 
         self._build_actions()
         self._build_toolbar()
+        self._build_statusbar()
         self._build_menus()
         self._apply_theme(config.get_dark_mode())
         self.sidebar.setVisible(config.get_sidebar_visible())
@@ -238,7 +240,20 @@ class MainWindow(QMainWindow):
         self.act_zoom_out.triggered.connect(lambda: self._on_tab(lambda t: t.zoom_out()))
 
         self.act_fit = QAction("Fit Width", self)
+        self.act_fit.setShortcut(QKeySequence(Qt.CTRL | Qt.Key_0))
         self.act_fit.triggered.connect(lambda: self._on_tab(lambda t: t.fit_width()))
+
+        self.act_actual_size = QAction("100%", self)
+        self.act_actual_size.setShortcut(QKeySequence(Qt.CTRL | Qt.Key_1))
+        self.act_actual_size.triggered.connect(
+            lambda: self._on_tab(lambda t: t.zoom_actual())
+        )
+
+        self.act_fit_page = QAction("Fit Page", self)
+        self.act_fit_page.setShortcut(QKeySequence(Qt.CTRL | Qt.Key_2))
+        self.act_fit_page.triggered.connect(
+            lambda: self._on_tab(lambda t: t.fit_page())
+        )
 
         self.act_set_sig = QAction("Signature setup...", self)
         self.act_set_sig.triggered.connect(self.open_signature_setup)
@@ -322,6 +337,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_close_tab)
 
         view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction(self.act_zoom_in)
+        view_menu.addAction(self.act_zoom_out)
+        view_menu.addAction(self.act_actual_size)
+        view_menu.addAction(self.act_fit)
+        view_menu.addAction(self.act_fit_page)
+        view_menu.addSeparator()
         view_menu.addAction(self.act_toggle_sidebar)
         view_menu.addAction(self.act_dark_mode)
 
@@ -371,6 +392,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_zoom_out)
         toolbar.addAction(self.act_zoom_in)
         toolbar.addAction(self.act_fit)
+        toolbar.addAction(self.act_fit_page)
         toolbar.addSeparator()
         toolbar.addAction(self.act_find)
         toolbar.addAction(self.act_print)
@@ -401,13 +423,11 @@ class MainWindow(QMainWindow):
 
         toolbar.addAction(self.act_save_as)
 
-        self.status_label = QLabel("No document")
-        self.statusBar().addPermanentWidget(self.status_label)
-
         # Apply tooltips that include the shortcut hint, e.g. "Find (Ctrl+F)".
         for action in (
             self.act_open, self.act_prev, self.act_next,
-            self.act_zoom_out, self.act_zoom_in, self.act_fit,
+            self.act_zoom_out, self.act_zoom_in,
+            self.act_fit, self.act_fit_page, self.act_actual_size,
             self.act_find, self.act_print,
             self.act_add_text, self.act_add_highlight,
             self.act_set_sig, self.act_add_sig,
@@ -417,6 +437,87 @@ class MainWindow(QMainWindow):
             shortcut = action.shortcut().toString()
             label = action.text().replace("&&", "&").replace("...", "")
             action.setToolTip(f"{label} ({shortcut})" if shortcut else label)
+
+    def _build_statusbar(self) -> None:
+        """Bottom-left zoom controls and page jump (Adobe-style); the combined
+        page/zoom summary label stays on the right as before."""
+        bar = self.statusBar()
+
+        def small_button(text: str, action: QAction) -> QToolButton:
+            btn = QToolButton(self)
+            btn.setText(text)
+            btn.setToolTip(action.toolTip())
+            btn.clicked.connect(action.trigger)
+            return btn
+
+        def action_button(action: QAction) -> QToolButton:
+            btn = QToolButton(self)
+            btn.setDefaultAction(action)
+            return btn
+
+        self.zoom_edit = QLineEdit(self)
+        self.zoom_edit.setFixedWidth(56)
+        self.zoom_edit.setAlignment(Qt.AlignCenter)
+        self.zoom_edit.setToolTip("Zoom — type a percent and press Enter")
+        self.zoom_edit.returnPressed.connect(self._on_zoom_edited)
+
+        self.page_edit = QLineEdit(self)
+        self.page_edit.setFixedWidth(44)
+        self.page_edit.setAlignment(Qt.AlignCenter)
+        self.page_edit.setToolTip("Page — type a number and press Enter to jump")
+        self.page_edit.returnPressed.connect(self._on_page_edited)
+        self.page_count_label = QLabel("/ 0", self)
+
+        btn_zoom_out = small_button("−", self.act_zoom_out)
+        btn_zoom_in = small_button("+", self.act_zoom_in)
+        btn_fit = action_button(self.act_fit)
+        btn_fit_page = action_button(self.act_fit_page)
+        btn_actual = action_button(self.act_actual_size)
+
+        for widget in (
+            btn_zoom_out, self.zoom_edit, btn_zoom_in,
+            btn_fit, btn_fit_page, btn_actual,
+            QLabel("   Page", self), self.page_edit, self.page_count_label,
+        ):
+            bar.addWidget(widget)
+
+        # Widgets that only make sense with a document open.
+        self._doc_widgets = [
+            btn_zoom_out, self.zoom_edit, btn_zoom_in,
+            btn_fit, btn_fit_page, btn_actual, self.page_edit,
+        ]
+
+        self.status_label = QLabel("No document")
+        bar.addPermanentWidget(self.status_label)
+
+    def _on_zoom_edited(self) -> None:
+        tab = self.current_tab()
+        if tab is None:
+            return
+        text = self.zoom_edit.text().strip().rstrip("%").strip()
+        try:
+            percent = float(text)
+        except ValueError:
+            percent = 0.0
+        if percent > 0:
+            tab.set_zoom_percent(percent)
+        # Hand focus back to the document and normalise the box: clamped or
+        # invalid input may not change the zoom, so `changed` may never fire.
+        tab.view.setFocus()
+        self._update_status()
+
+    def _on_page_edited(self) -> None:
+        tab = self.current_tab()
+        if tab is None:
+            return
+        try:
+            page = int(self.page_edit.text().strip())
+        except ValueError:
+            page = 0
+        if page >= 1:
+            tab.goto_page(min(page, tab.doc.page_count) - 1)
+        tab.view.setFocus()
+        self._update_status()
 
     def _on_tab(self, fn) -> None:
         tab = self.current_tab()
@@ -632,6 +733,29 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("No document")
             self.setWindowTitle(f"Inkstone {version_string()}")
+        self._update_zoom_page_widgets(tab)
+
+    def _update_zoom_page_widgets(self, tab: DocumentTab | None) -> None:
+        """Sync the status-bar zoom/page controls with the active tab.
+
+        Boxes the user is currently typing in are left alone so a scroll or
+        background render doesn't overwrite their input.
+        """
+        has_doc = tab is not None and tab.doc.is_open
+        for widget in self._doc_widgets:
+            widget.setEnabled(has_doc)
+        if tab is None or not tab.doc.is_open:
+            if not self.zoom_edit.hasFocus():
+                self.zoom_edit.clear()
+            if not self.page_edit.hasFocus():
+                self.page_edit.clear()
+            self.page_count_label.setText("/ 0")
+            return
+        if not self.zoom_edit.hasFocus():
+            self.zoom_edit.setText(f"{int(round(tab.zoom * 100))}%")
+        if not self.page_edit.hasFocus():
+            self.page_edit.setText(str(tab.current_page + 1))
+        self.page_count_label.setText(f"/ {tab.doc.page_count}")
 
     # ----- sidebar & theme ---------------------------------------------------
     def _on_tab_changed(self, _index: int = -1) -> None:

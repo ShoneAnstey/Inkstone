@@ -22,6 +22,10 @@ _WINDOW_STATE = "window/state"
 _RECENT_FILES = "files/recent"
 _DARK_MODE = "ui/dark_mode"
 _SIDEBAR_VISIBLE = "ui/sidebar_visible"
+_ZOOM_MODE = "ui/zoom_mode"
+_ZOOM_LEVEL = "ui/zoom_level"
+
+ZOOM_MODES = ("fit_width", "fit_page", "custom")
 
 
 _migrated = False
@@ -126,8 +130,36 @@ def set_sidebar_visible(visible: bool) -> None:
     _settings().setValue(_SIDEBAR_VISIBLE, bool(visible))
 
 
+def get_zoom_mode() -> str:
+    """Last-used zoom mode; documents open in this mode.
+
+    "fit_width" is the first-run default so a document looks right on any
+    monitor/DPI combination.
+    """
+    value = str(_settings().value(_ZOOM_MODE, "fit_width"))
+    return value if value in ZOOM_MODES else "fit_width"
+
+
+def set_zoom_mode(mode: str) -> None:
+    if mode in ZOOM_MODES:
+        _settings().setValue(_ZOOM_MODE, mode)
+
+
+def get_zoom_level() -> float:
+    """Last-used zoom factor (1.0 = 100%), used when the mode is "custom"."""
+    try:
+        value = float(str(_settings().value(_ZOOM_LEVEL, 1.5)))
+    except (TypeError, ValueError):
+        value = 1.5
+    return max(0.25, min(5.0, value))
+
+
+def set_zoom_level(zoom: float) -> None:
+    _settings().setValue(_ZOOM_LEVEL, float(zoom))
+
+
 def cache_dir() -> str:
-    """Return a writable per-user cache directory for XPDF, creating it if needed."""
+    """Return a writable per-user cache directory for Inkstone, creating it if needed."""
     base = QStandardPaths.writableLocation(QStandardPaths.CacheLocation)
     if not base:
         base = os.path.join(os.path.expanduser("~"), ".cache", APP)

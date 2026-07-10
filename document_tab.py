@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import config
 from pdf_document import PdfDocument, PdfAnnotation
 from highlight_item import HighlightItem
 from signature_item import SignatureItem
@@ -47,7 +48,12 @@ class DocumentTab(QWidget):
         super().__init__()
         self.doc = PdfDocument()
         self.path = path
-        self.zoom = 1.5
+        # Zoom mode/level are remembered app-wide across sessions. Fit modes are
+        # recomputed for this window once the viewport has a real size (see
+        # showEvent) and again whenever the viewport is resized.
+        self.zoom = config.get_zoom_level()
+        self._zoom_mode = config.get_zoom_mode()
+        self._did_initial_fit = False
         self._dpr = 1.0
         self._current_page = 0
         # Page layout is computed cheaply from page sizes; pixmaps are rendered
@@ -77,6 +83,13 @@ class DocumentTab(QWidget):
         self._search_timer = QTimer(self)
         self._search_timer.setInterval(0)
         self._search_timer.timeout.connect(self._search_chunk)
+
+        # Debounces viewport resizes so a fit-width/fit-page zoom is recomputed
+        # once at the end of a drag-resize rather than on every pixel.
+        self._refit_timer = QTimer(self)
+        self._refit_timer.setSingleShot(True)
+        self._refit_timer.setInterval(150)
+        self._refit_timer.timeout.connect(self._apply_zoom_mode)
 
         self.scene = QGraphicsScene(self)
         self.view = QGraphicsView(self.scene)
@@ -259,7 +272,7 @@ class DocumentTab(QWidget):
         self.view.ensureVisible(rect, 40, 40)
         self.find_status.setText(f"{idx + 1} / {len(self._matches)}")
 
-    # ----- Ctrl+wheel zoom ---------------------------------------------------
+    # ----- Ctrl+wheel zoom / viewport resize ----------------------------------
     def eventFilter(self, obj, event) -> bool:
         if (
             obj is self.view.viewport()
@@ -272,7 +285,22 @@ class DocumentTab(QWidget):
             else:
                 self.zoom_out(anchor)
             return True  # consume so the view doesn't also scroll
+        if (
+            obj is self.view.viewport()
+            and event.type() == QEvent.Resize
+            and self._did_initial_fit
+            and self._zoom_mode != "custom"
+        ):
+            self._refit_timer.start()
         return super().eventFilter(obj, event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._did_initial_fit:
+            self._did_initial_fit = True
+            # The viewport has no real size until the first layout pass has run,
+            # so defer the fit until the event loop settles.
+            QTimer.singleShot(0, self._apply_zoom_mode)
 
     # ----- info --------------------------------------------------------------
     @property
@@ -613,13 +641,39 @@ class DocumentTab(QWidget):
 
     # ----- zoom --------------------------------------------------------------
     def zoom_in(self, anchor: QPoint | None = None) -> None:
-        self._apply_zoom(self.zoom * ZOOM_STEP, anchor)
+        if self._apply_zoom(self.zoom * ZOOM_STEP, anchor):
+            self._set_zoom_mode("custom")
 
     def zoom_out(self, anchor: QPoint | None = None) -> None:
-        self._apply_zoom(self.zoom / ZOOM_STEP, anchor)
+        if self._apply_zoom(self.zoom / ZOOM_STEP, anchor):
+            self._set_zoom_mode("custom")
 
-    def _apply_zoom(self, value: float, anchor: QPoint | None = None) -> None:
-        """Set the zoom level.
+    def zoom_actual(self) -> None:
+        """Zoom to 100% (one PDF point per logical pixel)."""
+        self._apply_zoom(1.0)
+        self._set_zoom_mode("custom")
+
+    def set_zoom_percent(self, percent: float) -> None:
+        """Zoom to ``percent``/100, e.g. from the status-bar zoom box."""
+        self._apply_zoom(percent / 100.0)
+        self._set_zoom_mode("custom")
+
+    def _set_zoom_mode(self, mode: str) -> None:
+        """Record the zoom mode and persist mode + level for future documents."""
+        self._zoom_mode = mode
+        config.set_zoom_mode(mode)
+        config.set_zoom_level(self.zoom)
+
+    def _apply_zoom_mode(self) -> None:
+        """Recompute the zoom for the remembered mode (initial show / resize)."""
+        if self._zoom_mode == "fit_width":
+            self.fit_width()
+        elif self._zoom_mode == "fit_page":
+            self.fit_page()
+        # "custom": the stored zoom level is already applied.
+
+    def _apply_zoom(self, value: float, anchor: QPoint | None = None) -> bool:
+        """Set the zoom level. Returns True when the zoom actually changed.
 
         ``anchor`` is an optional viewport position (e.g. the mouse cursor during
         Ctrl+wheel) that should keep pointing at the same spot on the page after
@@ -627,7 +681,7 @@ class DocumentTab(QWidget):
         """
         value = max(ZOOM_MIN, min(ZOOM_MAX, value))
         if abs(value - self.zoom) < 1e-6:
-            return
+            return False
 
         # Capture the document position under the anchor before re-layout:
         # (page index, offset within the page in PDF points, viewport x/y).
@@ -660,6 +714,7 @@ class DocumentTab(QWidget):
                 scene_y + viewport.height() / 2.0 - view_y,
             )
             self._render_visible()
+        return True
 
     def fit_width(self) -> None:
         if not self.doc.is_open:
@@ -668,6 +723,19 @@ class DocumentTab(QWidget):
         viewport_width = self.view.viewport().width() - 24
         if width_points > 0 and viewport_width > 0:
             self._apply_zoom(viewport_width / width_points)
+            self._set_zoom_mode("fit_width")
+
+    def fit_page(self) -> None:
+        """Fit the whole current page (width and height) inside the viewport."""
+        if not self.doc.is_open:
+            return
+        width_points, height_points = self.doc.page_size_points(self._current_page)
+        viewport = self.view.viewport()
+        avail_w = viewport.width() - 24
+        avail_h = viewport.height() - 24
+        if min(width_points, height_points) > 0 and min(avail_w, avail_h) > 0:
+            self._apply_zoom(min(avail_w / width_points, avail_h / height_points))
+            self._set_zoom_mode("fit_page")
 
     # ----- signature ---------------------------------------------------------
     def add_signature(self, sig_path: str) -> bool:

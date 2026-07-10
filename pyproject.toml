@@ -1,5 +1,5 @@
 # ==============================================================================
-# XPDF — project + security-gate tool config.
+# Inkstone — project + security-gate tool config.
 #
 # Tool sections (ruff, mypy, bandit) are consumed by security/pre_commit_hook.py.
 # Install the gate tooling with:
