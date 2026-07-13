@@ -1,6 +1,7 @@
 name: Build binaries
 
-# Builds the portable Windows .exe, a Windows installer, and the Linux AppImage.
+# Builds the portable Windows .exe, a Windows installer, the Linux AppImage,
+# and a Debian/Ubuntu .deb package.
 # Trigger manually from the Actions tab, or on a version tag (v*).
 on:
   workflow_dispatch:
@@ -62,11 +63,18 @@ jobs:
         run: .venv/bin/python packaging/stamp_build.py
       - name: Build AppImage
         run: bash packaging/build_appimage.sh
-      - name: Upload artifact
+      - name: Build .deb
+        run: bash packaging/build_deb.sh
+      - name: Upload AppImage
         uses: actions/upload-artifact@v5
         with:
           name: Inkstone-linux
           path: dist/Inkstone-x86_64.AppImage
+      - name: Upload .deb
+        uses: actions/upload-artifact@v5
+        with:
+          name: Inkstone-linux-deb
+          path: dist/inkstone_*.deb
 
   release:
     # Publish a GitHub Release with the binaries when a version tag is pushed.
@@ -90,4 +98,5 @@ jobs:
             --generate-notes \
             "artifacts/Inkstone-windows-installer/Inkstone-Setup.exe" \
             "artifacts/Inkstone-windows-portable/Inkstone.exe" \
-            "artifacts/Inkstone-linux/Inkstone-x86_64.AppImage"
+            "artifacts/Inkstone-linux/Inkstone-x86_64.AppImage" \
+            artifacts/Inkstone-linux-deb/inkstone_*.deb

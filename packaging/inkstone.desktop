@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Inkstone
+Comment=Simple, lightweight PDF reader
+Exec=inkstone %F
+Icon=inkstone
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;

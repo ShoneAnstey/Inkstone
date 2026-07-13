@@ -76,12 +76,32 @@ def set_recent_files(paths: list[str]) -> None:
     _settings().setValue(_RECENT_FILES, list(paths))
 
 
+def get_existing_recent_files() -> list[str]:
+    """Recent files whose paths still exist on disk.
+
+    Prunes dead entries from storage so the list doesn't accumulate stale
+    paths forever. The single pruning policy for every recents UI surface.
+    """
+    recent = get_recent_files()
+    existing = [p for p in recent if os.path.exists(p)]
+    if existing != recent:
+        set_recent_files(existing)
+    return existing
+
+
 def add_recent_file(path: str) -> None:
     recent = get_recent_files()
     if path in recent:
         recent.remove(path)
     recent.insert(0, path)
     set_recent_files(recent[:10])  # keep top 10
+
+
+def remove_recent_file(path: str) -> None:
+    recent = get_recent_files()
+    if path in recent:
+        recent.remove(path)
+        set_recent_files(recent)
 
 
 def clear_recent_files() -> None:

@@ -10,16 +10,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"   # repo root: contains main.py and packaging/
-PY="${PYTHON:-$ROOT/.venv/bin/python}"
 
 cd "$ROOT"
 
-echo ">> Installing build tooling (PyInstaller)…"
-"$PY" -m pip install --quiet --upgrade pyinstaller
-
-echo ">> Building one-dir bundle with PyInstaller…"
-rm -rf build "dist/Inkstone"
-"$PY" -m PyInstaller --noconfirm "$ROOT/packaging/inkstone.spec"
+"$HERE/build_bundle.sh"
 
 APPDIR="build/AppDir"
 echo ">> Assembling AppDir at $APPDIR…"
@@ -31,15 +25,10 @@ cp -r "dist/Inkstone/." "$APPDIR/usr/bin/"
 cp "$ROOT/packaging/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/inkstone.png"
 cp "$ROOT/packaging/icon.png" "$APPDIR/inkstone.png"
 
-cat > "$APPDIR/usr/share/applications/inkstone.desktop" <<'DESKTOP'
-[Desktop Entry]
-Type=Application
-Name=Inkstone
-Exec=Inkstone
-Icon=inkstone
-Categories=Office;Viewer;
-MimeType=application/pdf;
-DESKTOP
+# Shared desktop entry, with Exec rewritten to the binary name inside the
+# AppDir (AppRun forwards any file arguments).
+sed 's|^Exec=.*|Exec=Inkstone %F|' "$ROOT/packaging/inkstone.desktop" \
+    > "$APPDIR/usr/share/applications/inkstone.desktop"
 cp "$APPDIR/usr/share/applications/inkstone.desktop" "$APPDIR/inkstone.desktop"
 
 cat > "$APPDIR/AppRun" <<'APPRUN'

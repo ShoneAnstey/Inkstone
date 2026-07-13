@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QToolBar,
     QToolButton,
@@ -33,6 +34,7 @@ import config
 from document_tab import DocumentTab
 from sidebar import Sidebar
 from signature_processing import prepare_signature
+from start_page import StartPage
 from text_item import TextItem
 from version import build_metadata, version_string
 
@@ -184,9 +186,18 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar(self)
         self.sidebar.page_selected.connect(self._on_sidebar_page_selected)
 
+        # Start page and the tab widget share the right pane; the stack shows
+        # the start page whenever no document is open.
+        self.start_page = StartPage(self)
+        self.start_page.open_requested.connect(self.open_dialog)
+        self.start_page.file_selected.connect(self.open_path)
+        self._stack = QStackedWidget(self)
+        self._stack.addWidget(self.start_page)
+        self._stack.addWidget(self.tabs)
+
         splitter = QSplitter(Qt.Horizontal, self)
         splitter.addWidget(self.sidebar)
-        splitter.addWidget(self.tabs)
+        splitter.addWidget(self._stack)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([220, 780])
@@ -199,6 +210,8 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._apply_theme(config.get_dark_mode())
         self.sidebar.setVisible(config.get_sidebar_visible())
+        self._refresh_recent_ui()
+        self._update_start_page()
         self._update_status()
 
         geometry = config.get_window_geometry()
@@ -327,7 +340,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_open)
 
         self.menu_recent = file_menu.addMenu("Open Recent")
-        self._populate_recent_menu()
+        # Populated by _refresh_recent_ui() once the start page also exists.
 
         file_menu.addSeparator()
         file_menu.addAction(self.act_save_as)
@@ -349,14 +362,25 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction(self.act_about)
 
-    def _populate_recent_menu(self) -> None:
+    def _update_start_page(self) -> None:
+        """Show the start page when no document is open, the tabs otherwise."""
+        if self.tabs.count() == 0:
+            self._stack.setCurrentWidget(self.start_page)
+        else:
+            self._stack.setCurrentWidget(self.tabs)
+
+    def _refresh_recent_ui(self) -> None:
+        """Rebuild every recents surface (menu + start page) from one pruned read.
+
+        The single entry point for recents changes, so the menu and the start
+        page can never disagree about what the list contains.
+        """
+        existing = config.get_existing_recent_files()
+        self._populate_recent_menu(existing)
+        self.start_page.refresh(existing)
+
+    def _populate_recent_menu(self, existing: list[str]) -> None:
         self.menu_recent.clear()
-        recent = config.get_recent_files()
-        # Prune entries whose files no longer exist so the stored list doesn't
-        # accumulate dead paths forever.
-        existing = [p for p in recent if os.path.exists(p)]
-        if existing != recent:
-            config.set_recent_files(existing)
         if not existing:
             empty = self.menu_recent.addAction("No recent files")
             empty.setEnabled(False)
@@ -374,7 +398,7 @@ class MainWindow(QMainWindow):
 
     def _clear_recent_files(self) -> None:
         config.clear_recent_files()
-        self._populate_recent_menu()
+        self._refresh_recent_ui()
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main", self)
@@ -551,13 +575,18 @@ class MainWindow(QMainWindow):
             tab = DocumentTab(path)
         except Exception as exc:  # noqa: BLE001 - surface any load error
             QMessageBox.critical(self, "Open failed", f"Could not open PDF:\n{exc}")
+            # A recent entry whose file vanished is dead weight — drop it
+            # everywhere rather than keep offering it.
+            if not os.path.exists(path):
+                config.remove_recent_file(path)
+                self._refresh_recent_ui()
             return
         tab.changed.connect(self._update_status)
         tab.structure_changed.connect(self._refresh_sidebar)
         tab.changed.connect(self._sync_sidebar_highlight)
         config.set_last_dir(os.path.dirname(path))
         config.add_recent_file(path)
-        self._populate_recent_menu()
+        self._refresh_recent_ui()
         index = self.tabs.addTab(tab, tab.title)
         self.tabs.setTabToolTip(index, path)
         # Making the new tab current fires currentChanged -> _on_tab_changed,
@@ -765,6 +794,7 @@ class MainWindow(QMainWindow):
     # ----- sidebar & theme ---------------------------------------------------
     def _on_tab_changed(self, _index: int = -1) -> None:
         """Refresh the status bar and rebuild the sidebar for the active tab."""
+        self._update_start_page()
         self._update_status()
         self._refresh_sidebar()
 
