@@ -329,8 +329,17 @@ class DocumentTab(QWidget):
         return "No document"
 
     # ----- rendering ---------------------------------------------------------
-    def render_all_pages(self, preserve_scroll: bool = False) -> None:
-        """Lay out every page stacked vertically; render the visible ones lazily."""
+    def render_all_pages(
+        self,
+        preserve_scroll: bool = False,
+        page_map: Callable[[int], int | None] | None = None,
+    ) -> None:
+        """Lay out every page stacked vertically; render the visible ones lazily.
+
+        ``page_map`` is given when the page set itself changed (a page was
+        deleted): it maps an old page index to its new one, or to None when
+        that page is gone, so overlays follow their page or go with it.
+        """
         if not self.doc.is_open:
             return
 
@@ -358,6 +367,24 @@ class DocumentTab(QWidget):
         ]
         for item in keep_items:
             self.scene.removeItem(item)
+        if page_map is not None:
+            remapped: list[tuple[QGraphicsItem, tuple[int, float, float] | None]] = []
+            for item, anchor in overlay_anchors:
+                if anchor is None:
+                    remapped.append((item, anchor))
+                    continue
+                new_page = page_map(anchor[0])
+                if new_page is None:
+                    # Its page was deleted; the overlay goes with it.
+                    if item is keep_sig:
+                        keep_sig = None
+                    elif item in keep_texts:
+                        keep_texts = [t for t in keep_texts if t is not item]
+                    elif item in keep_highlights:
+                        keep_highlights = [h for h in keep_highlights if h is not item]
+                    continue
+                remapped.append((item, (new_page, anchor[1], anchor[2])))
+            overlay_anchors = remapped
 
         self.scene.clear()
         self._page_sizes = []
@@ -499,6 +526,11 @@ class DocumentTab(QWidget):
         if abs(scale_ratio - 1.0) >= 1e-9:
             item.setScale(item.scale() * scale_ratio)
         px, py = self._page_pos[page]
+        # Keep the anchor on the page: after a page rotation its old offset can
+        # fall outside the page's new shape.
+        width, height = self._page_sizes[page]
+        pt_x = min(max(pt_x, 0.0), width / self.zoom)
+        pt_y = min(max(pt_y, 0.0), height / self.zoom)
         centre = self._overlay_scene_rect(item).center()
         item.moveBy(px + pt_x * self.zoom - centre.x(), py + pt_y * self.zoom - centre.y())
 
@@ -532,17 +564,22 @@ class DocumentTab(QWidget):
             self.view.verticalScrollBar().setValue(int(top))
 
     # ----- navigation --------------------------------------------------------
-    def ok_to_discard_annotations(self) -> bool:
-        """Ask before throwing away any placed-but-unsaved annotations."""
-        if not self.has_annotations:
+    def confirm_close(self, sig_path: str | None) -> bool:
+        """Offer to save unsaved changes. True if the tab may now be closed."""
+        if not self.modified:
             return True
         reply = QMessageBox.warning(
             self,
             "Unsaved changes",
-            "You placed annotations but haven't saved them yet. Discard them?",
-            QMessageBox.Discard | QMessageBox.Cancel,
+            f"Save changes to {self.title} before closing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
         )
-        return reply == QMessageBox.Discard
+        if reply == QMessageBox.StandardButton.Save:
+            return self.save(sig_path)
+        return reply == QMessageBox.StandardButton.Discard
 
     def next_page(self) -> None:
         if self.doc.is_open and self._current_page < self.doc.page_count - 1:
@@ -617,7 +654,7 @@ class DocumentTab(QWidget):
         return True
 
     def delete_page(self, page_index: int) -> bool:
-        """Delete page ``page_index`` from the document on disk, after confirming."""
+        """Delete page ``page_index`` after confirming. Written to disk on save."""
         if not self.doc.is_open:
             return False
         if self.doc.page_count <= 1:
@@ -625,91 +662,70 @@ class DocumentTab(QWidget):
                 self, "Can't delete", "A PDF must keep at least one page."
             )
             return False
-        # Deleting rewrites the file, so any placed-but-unsaved signature or text
-        # would be lost. Confirm discarding those first (no prompt if there are none).
-        if not self.ok_to_discard_annotations():
-            return False
-        reply = QMessageBox.warning(
+        reply = QMessageBox.question(
             self,
             "Delete page",
-            f"Delete page {page_index + 1} of {self.doc.page_count}? "
-            "This rewrites the file on disk and can't be undone here.",
-            QMessageBox.Yes | QMessageBox.No,
+            f"Delete page {page_index + 1} of {self.doc.page_count}?\n\n"
+            "The file isn't changed until you save.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return False
         try:
             self.doc.delete_page(page_index)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Delete failed", f"Could not delete page:\n{exc}")
             return False
-        # The delete succeeded: only now is it safe to drop the unsaved overlays
-        # (their page coordinates are no longer valid) and re-render. Search
-        # matches also hold pre-delete page indices, so they're invalid too.
-        self._discard_overlays()
+
+        def remap(old: int) -> int | None:
+            if old == page_index:
+                return None
+            return old - 1 if old > page_index else old
+
+        # Undo entries may point at overlays that are about to go with the page.
+        self._undo_stack.clear()
+        # Search matches hold pre-delete page indices, so they're invalid now.
         self._clear_matches()
         self.find_status.clear()
         self._current_page = min(self._current_page, self.doc.page_count - 1)
-        self.render_all_pages()
-        # Page geometry changed; a fit mode may need a different zoom now.
-        self._refit_timer.start()
-        self.structure_changed.emit()
+        # Overlays follow their page; any on the deleted page go with it.
+        self.render_all_pages(page_map=remap)
+        self._after_page_change()
         return True
 
     def rotate_page(self, page_index: int, delta_deg: int) -> bool:
-        """Rotate page ``page_index`` by 90 degrees and rewrite the file on disk."""
+        """Rotate page ``page_index`` by 90 degrees. Written to disk on save."""
         if not self.doc.is_open:
-            return False
-        # Rotating rewrites the file, so unsaved overlays (whose page coordinates
-        # would no longer line up) must be discarded first.
-        if not self.ok_to_discard_annotations():
             return False
         try:
             self.doc.rotate_page(page_index, delta_deg)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Rotate failed", f"Could not rotate page:\n{exc}")
             return False
-        self._discard_overlays()
         self._clear_matches()
         self.find_status.clear()
         self.render_all_pages(preserve_scroll=True)
-        # Page geometry changed; a fit mode may need a different zoom now.
-        self._refit_timer.start()
-        self.structure_changed.emit()
+        self._after_page_change()
         return True
 
     def append_pdf(self, source_path: str) -> bool:
-        """Append all pages of another PDF to this document on disk."""
+        """Append all pages of another PDF. Written to disk on save."""
         if not self.doc.is_open:
-            return False
-        if not self.ok_to_discard_annotations():
             return False
         try:
             self.doc.append_pdf(source_path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Append failed", f"Could not append PDF:\n{exc}")
             return False
-        self._discard_overlays()
-        self._clear_matches()
-        self.find_status.clear()
         self.render_all_pages(preserve_scroll=True)
+        self._after_page_change()
+        return True
+
+    def _after_page_change(self) -> None:
         # Page geometry changed; a fit mode may need a different zoom now.
         self._refit_timer.start()
         self.structure_changed.emit()
-        return True
-
-    def _discard_overlays(self) -> None:
-        """Remove any placed-but-unsaved signature/text/highlight overlays from the scene."""
-        self._undo_stack.clear()
-        if self._signature is not None:
-            self.scene.removeItem(self._signature)
-            self._signature = None
-        for txt in self._texts:
-            self.scene.removeItem(txt)
-        self._texts = []
-        for hl in self._highlights:
-            self.scene.removeItem(hl)
-        self._highlights = []
+        self.changed.emit()
 
     # ----- zoom --------------------------------------------------------------
     def zoom_in(self, anchor: QPoint | None = None) -> None:
@@ -858,6 +874,7 @@ class DocumentTab(QWidget):
         self._signature = item
         self._undo_stack.append(lambda: self._undo_remove_signature(item))
         self.view.ensureVisible(item.content_scene_rect(), 20, 20)
+        self.changed.emit()
         return True
 
     def _undo_remove_signature(self, item: SignatureItem) -> None:
@@ -884,6 +901,7 @@ class DocumentTab(QWidget):
         item.setSelected(True)
         item.setFocus()
         self.view.ensureVisible(item.boundingRect(), 20, 20)
+        self.changed.emit()
         return True
 
     def _undo_remove_text(self, item: TextItem) -> None:
@@ -910,6 +928,7 @@ class DocumentTab(QWidget):
         item.setSelected(True)
         item.setFocus()
         self.view.ensureVisible(item.boundingRect(), 20, 20)
+        self.changed.emit()
         return True
 
     def _undo_remove_highlight(self, item: HighlightItem) -> None:
@@ -922,6 +941,7 @@ class DocumentTab(QWidget):
             self._highlights.remove(item)
             self.scene.removeItem(item)
             self._undo_stack.append(lambda: self._undo_restore_highlight(item))
+            self.changed.emit()
 
     def _undo_restore_highlight(self, item: HighlightItem) -> None:
         if item not in self._highlights:
@@ -933,6 +953,7 @@ class DocumentTab(QWidget):
         if not self._undo_stack:
             return False
         self._undo_stack.pop()()
+        self.changed.emit()
         return True
 
     def rotate_signature(self, delta_deg: int) -> bool:
@@ -951,6 +972,11 @@ class DocumentTab(QWidget):
             or bool(self._texts)
             or bool(self._highlights)
         )
+
+    @property
+    def modified(self) -> bool:
+        """True if anything is unsaved: placed annotations or page changes."""
+        return self.has_annotations or self.doc.modified
 
     def _collect_annotations(self, sig_path: str | None) -> list[PdfAnnotation] | None:
         """Gather all signatures and texts. Returns None if validation fails."""
@@ -1040,16 +1066,35 @@ class DocumentTab(QWidget):
 
         return annotations
 
-    def save_signed(self, sig_path: str) -> bool:
-        if not self.doc.is_open or not self.has_annotations or not self._page_sizes:
-            return False
+    def save(self, sig_path: str | None) -> bool:
+        """Write every unsaved change back to the file this tab opened.
 
-        annotations = self._collect_annotations(sig_path)
-        if annotations is None:
-            return False  # validation failed
+        Returns True when the file on disk is up to date afterwards (including
+        when there was nothing to save).
+        """
+        if not self.doc.is_open:
+            return False
+        if not self.modified:
+            return True
+
+        annotations: list[PdfAnnotation] = []
+        if self.has_annotations:
+            collected = self._collect_annotations(sig_path)
+            if collected is None:
+                return False  # validation failed
+            annotations = collected
 
         try:
             self.doc.save_with_annotations(self.path, annotations, self.zoom)
+        except PermissionError:
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Inkstone couldn't overwrite {self.title}.\n\n"
+                "The file is read-only or open in another program. Close it "
+                "there and save again, or use Save As to write a copy.",
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Save failed", f"Could not save:\n{exc}")
             return False

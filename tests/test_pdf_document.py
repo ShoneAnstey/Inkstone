@@ -53,13 +53,22 @@ def test_search_page(doc):
 
 
 # ----- page surgery ------------------------------------------------------------
+# Page changes happen in memory; the file is only rewritten by save().
 def test_delete_page(doc, pdf_path):
     version = doc.structure_version
+    before = open(pdf_path, "rb").read()
+    assert not doc.modified
     doc.delete_page(1)
     assert doc.page_count == 2
     assert doc.structure_version == version + 1
     assert doc.path == pdf_path
-    # The file on disk was really rewritten.
+    assert doc.modified
+    # Nothing on disk yet...
+    assert open(pdf_path, "rb").read() == before
+    # ...until it is saved.
+    doc.save()
+    assert not doc.modified
+    assert doc.is_open and doc.page_count == 2
     with fitz.open(pdf_path) as check:
         assert check.page_count == 2
         assert "page 1" in check[0].get_text()
@@ -83,11 +92,20 @@ def test_rotate_page(doc, pdf_path):
     version = doc.structure_version
     doc.rotate_page(1, 90)
     assert doc.structure_version == version + 1
+    assert doc.modified
+    # The open document shows the rotation (A4 portrait becomes landscape)...
+    width, height = doc.page_size_points(1)
+    assert width > height
+    # ...the file doesn't, until saved.
+    with fitz.open(pdf_path) as check:
+        assert check[1].rotation == 0
+    doc.save()
     with fitz.open(pdf_path) as check:
         assert check[1].rotation == 90
         assert check[0].rotation == 0
     # Rotating back restores the original orientation.
     doc.rotate_page(1, -90)
+    doc.save()
     with fitz.open(pdf_path) as check:
         assert check[1].rotation == 0
 
@@ -104,10 +122,101 @@ def test_append_pdf(doc, pdf_path, tmp_path):
     doc.append_pdf(other)
     assert doc.page_count == 5
     assert doc.structure_version == version + 1
+    assert doc.modified
+    with fitz.open(pdf_path) as check:
+        assert check.page_count == 3
+    doc.save()
     with fitz.open(pdf_path) as check:
         assert check.page_count == 5
         assert "Appended page 1" in check[3].get_text()
         assert "Appended page 2" in check[4].get_text()
+
+
+def test_closing_without_saving_leaves_the_file_alone(doc, pdf_path):
+    before = open(pdf_path, "rb").read()
+    doc.delete_page(0)
+    doc.rotate_page(0, 90)
+    doc.close()
+    assert open(pdf_path, "rb").read() == before
+
+
+def test_save_with_nothing_changed_does_not_touch_the_file(doc, pdf_path):
+    before = open(pdf_path, "rb").read()
+    doc.save()
+    assert open(pdf_path, "rb").read() == before
+    assert doc.is_open and not doc.modified
+
+
+def test_save_page_change_and_annotation_together(doc, pdf_path):
+    doc.delete_page(0)  # old page 2 is now page 1
+    ann = PdfAnnotation(page_index=0, rect_pixels=(100.0, 200.0, 400.0, 300.0), type="text", text="NOTE")
+    doc.save_with_annotations(pdf_path, [ann], 1.0)
+    assert not doc.modified
+    with fitz.open(pdf_path) as check:
+        assert check.page_count == 2
+        assert "page 2" in check[0].get_text() and "NOTE" in check[0].get_text()
+        assert "NOTE" not in check[1].get_text()
+    # The live document is the saved one: saving again changes nothing.
+    assert "NOTE" in "".join(s["text"] for s in _text_spans(pdf_path))
+    before = open(pdf_path, "rb").read()
+    doc.save()
+    assert open(pdf_path, "rb").read() == before
+
+
+def test_save_as_includes_pending_page_changes_and_keeps_them_pending(doc, pdf_path, tmp_path):
+    target = str(tmp_path / "copy.pdf")
+    before = open(pdf_path, "rb").read()
+    doc.delete_page(2)
+    doc.save_with_annotations(target, [], 1.0)
+    with fitz.open(target) as check:
+        assert check.page_count == 2
+    # The original file is untouched and the open document still has the change to save.
+    assert open(pdf_path, "rb").read() == before
+    assert doc.modified and doc.page_count == 2 and doc.path == pdf_path
+
+
+def test_refused_overwrite_keeps_the_unsaved_page_changes(doc, pdf_path, monkeypatch, tmp_path):
+    """Read-only file / open in another program: nothing is lost, and a retry works."""
+    import pdf_document
+
+    before = open(pdf_path, "rb").read()
+    doc.delete_page(1)
+    real_replace = pdf_document.os.replace
+
+    def refuse(src, dst):
+        raise PermissionError(13, "Access is denied", dst)
+
+    monkeypatch.setattr(pdf_document.os, "replace", refuse)
+    with pytest.raises(PermissionError):
+        doc.save()
+    # File untouched, no temp file left behind, edits still there and still unsaved.
+    assert open(pdf_path, "rb").read() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["sample.pdf"]
+    assert doc.is_open and doc.modified and doc.page_count == 2
+    assert doc.search_page(1, "page 3")
+
+    monkeypatch.setattr(pdf_document.os, "replace", real_replace)
+    doc.save()
+    assert not doc.modified
+    with fitz.open(pdf_path) as check:
+        assert check.page_count == 2
+
+
+def test_refused_overwrite_of_an_annotation_save_leaves_document_usable(doc, pdf_path, monkeypatch, tmp_path):
+    import pdf_document
+
+    before = open(pdf_path, "rb").read()
+
+    def refuse(src, dst):
+        raise PermissionError(13, "Access is denied", dst)
+
+    monkeypatch.setattr(pdf_document.os, "replace", refuse)
+    ann = PdfAnnotation(page_index=0, rect_pixels=(100.0, 200.0, 400.0, 300.0), type="text", text="NOTE")
+    with pytest.raises(PermissionError):
+        doc.save_with_annotations(pdf_path, [ann], 1.0)
+    assert open(pdf_path, "rb").read() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["sample.pdf"]
+    assert doc.is_open and doc.page_count == 3 and not doc.search_page(0, "NOTE")
 
 
 def test_append_pdf_to_itself_raises(doc, pdf_path):

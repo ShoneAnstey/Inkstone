@@ -49,6 +49,10 @@ class PdfDocument:
         # Bumped whenever the page set changes (e.g. a delete) so callers can tell
         # a cached view is stale without diffing the whole document.
         self._structure_version = 0
+        # True while the in-memory document differs from the file on disk: pages
+        # were rotated, deleted or appended and the result hasn't been saved.
+        # Nothing touches the file until save() / save_with_annotations().
+        self._modified = False
 
     # ----- lifecycle ---------------------------------------------------------
     def load(self, path: str) -> None:
@@ -61,11 +65,17 @@ class PdfDocument:
             self._doc.close()
             self._doc = None
         self.path = None
+        self._modified = False
         self._thumb_cache.clear()
 
     @property
     def is_open(self) -> bool:
         return self._doc is not None
+
+    @property
+    def modified(self) -> bool:
+        """True if page changes (rotate / delete / append) are waiting to be saved."""
+        return self._modified
 
     @property
     def structure_version(self) -> int:
@@ -150,30 +160,44 @@ class PdfDocument:
                         color=(0, 0, 0),
                     )
 
-    # ----- stamping ----------------------------------------------------------
+    # ----- saving ------------------------------------------------------------
+    def save(self) -> None:
+        """Write pending page changes back to the file this document was opened from."""
+        if self.path is None:
+            raise RuntimeError("No document open")
+        self.save_with_annotations(self.path, [], 1.0)
+
     def save_with_annotations(
         self,
         target_path: str,
         annotations: list[PdfAnnotation],
         zoom: float,
     ) -> None:
-        """Stamp annotations (images/text) into target_path.
+        """Write the document, with ``annotations`` stamped in, to ``target_path``.
 
-        If target_path is the currently open document, it writes to a temp file and
-        replaces the original atomically. Otherwise it copies the source and stamps.
+        If ``target_path`` is the open document, the result is written to a
+        temp file beside it and swapped in atomically, so a failure never
+        leaves a half-written file. Any other target gets a copy and the open
+        document stays as it is, pending changes included.
         """
         if self._doc is None or self.path is None:
             raise RuntimeError("No document open")
 
         target = os.path.abspath(target_path)
-        is_open_doc = (target == os.path.abspath(self.path))
-        target_save = target
+        is_open_doc = target == os.path.abspath(self.path)
+        if self._modified:
+            self._save_rewritten(target, annotations, zoom, is_open_doc)
+            return
+        if is_open_doc and not annotations:
+            return  # nothing has changed since the file was read
 
+        # No page changes pending, so the file on disk is still the document:
+        # append the annotations to a copy of it as an incremental update,
+        # which is fast and leaves the existing bytes (and any digital
+        # signatures over them) intact.
+        target_save = target
         if is_open_doc:
-            directory = os.path.dirname(target) or "."
-            fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=directory)
-            os.close(fd)
-            target_save = tmp_path
+            target_save = self._temp_beside(target)
 
         try:
             shutil.copyfile(self.path, target_save)
@@ -193,17 +217,76 @@ class PdfDocument:
             raise
 
         if is_open_doc:
-            self._doc.close()
-            self._doc = None
+            self._swap_in(target_save, target, fallback=None)
+
+    @staticmethod
+    def _temp_beside(target: str) -> str:
+        """An empty temp file in ``target``'s folder (same volume, so replace is atomic)."""
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=os.path.dirname(target) or ".")
+        os.close(fd)
+        return tmp_path
+
+    def _save_rewritten(
+        self, target: str, annotations: list[PdfAnnotation], zoom: float, is_open_doc: bool
+    ) -> None:
+        """Full rewrite, for when pages were rotated / deleted / appended in memory."""
+        if self._doc is None:
+            raise RuntimeError("No document open")
+        # Snapshot the in-memory document and work on a copy of that: a failure
+        # part-way (unreadable signature image, disk full) leaves the open
+        # document exactly as it was, and the snapshot can restore it if the
+        # final swap is refused.
+        snapshot = self._doc.tobytes()
+        tmp_path = self._temp_beside(target)
+        try:
+            work = fitz.open(stream=snapshot, filetype="pdf")
             try:
-                os.replace(target_save, target)
+                self._apply_annotations_to_work(work, annotations, zoom)
+                # garbage=4 drops the objects of deleted pages so the file shrinks.
+                work.save(tmp_path, garbage=4, deflate=True)
             finally:
-                if os.path.exists(target_save):
-                    os.remove(target_save)
+                work.close()
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+        if is_open_doc:
+            self._swap_in(tmp_path, target, fallback=snapshot)
+            self._modified = False
+        else:
+            try:
+                os.replace(tmp_path, target)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    def _swap_in(self, tmp_path: str, target: str, fallback: bytes | None) -> None:
+        """Replace ``target`` with ``tmp_path`` and reopen it as the live document.
+
+        The live document has to be closed first: Windows refuses to replace
+        a file that is open. If the replace is refused anyway (the file is
+        read-only, or open in another program), the document is reopened as
+        it was — from ``fallback`` when it had unsaved page changes, otherwise
+        from the untouched file — and the error propagates.
+        """
+        if self._doc is None:
+            raise RuntimeError("No document open")
+        self._doc.close()
+        self._doc = None
+        try:
+            os.replace(tmp_path, target)
+        except Exception:
+            if fallback is not None:
+                self._doc = fitz.open(stream=fallback, filetype="pdf")
+            else:
                 self._doc = fitz.open(target)
-                self.path = target
-
-
+            raise
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        self._doc = fitz.open(target)
+        self.path = target
 
     def copy_to(self, target_path: str) -> None:
         """Copy the currently-open file to ``target_path`` (no-op if same path)."""
@@ -232,6 +315,10 @@ class PdfDocument:
         ).copy()
         self._thumb_cache[(index, max_px)] = image
         return image
+
+    def cached_thumbnail(self, index: int, max_px: int = 160) -> QImage | None:
+        """The thumbnail for page ``index`` if it has already been rendered."""
+        return self._thumb_cache.get((index, max_px))
 
     def outline(self) -> list[tuple[int, str, int]]:
         """Return the table of contents as (level, title, page_index) rows.
@@ -269,11 +356,10 @@ class PdfDocument:
             out.close()
 
     def delete_page(self, index: int) -> None:
-        """Delete page ``index`` and overwrite the original file on disk.
+        """Delete page ``index``. The last remaining page cannot be deleted.
 
-        Mirrors the safe-save pattern used for stamping: the deletion happens in a
-        temporary copy that atomically replaces the original, so a failure leaves
-        the document untouched. The last remaining page cannot be deleted.
+        Like every page change this happens in memory: the file on disk is
+        only rewritten by save().
         """
         if self._doc is None or self.path is None:
             raise RuntimeError("No document open")
@@ -281,77 +367,41 @@ class PdfDocument:
             raise IndexError(f"Page {index} out of range")
         if self._doc.page_count <= 1:
             raise ValueError("Cannot delete the only page in the document")
-        self._rewrite_in_place(lambda work: work.delete_page(index))
+        self._doc.delete_page(index)
+        self._pages_changed()
 
     def rotate_page(self, index: int, delta_deg: int) -> None:
-        """Rotate page ``index`` by a multiple of 90 degrees and rewrite the file."""
+        """Rotate page ``index`` by a multiple of 90 degrees (in memory until saved)."""
         if self._doc is None or self.path is None:
             raise RuntimeError("No document open")
         if not (0 <= index < self._doc.page_count):
             raise IndexError(f"Page {index} out of range")
         if delta_deg % 90 != 0:
             raise ValueError("Rotation must be a multiple of 90 degrees")
-
-        def mutate(work: fitz.Document) -> None:
-            page = work[index]
-            page.set_rotation((page.rotation + delta_deg) % 360)
-
-        self._rewrite_in_place(mutate)
+        page = self._doc[index]
+        page.set_rotation((page.rotation + delta_deg) % 360)
+        self._pages_changed()
 
     def append_pdf(self, source_path: str) -> None:
-        """Append every page of ``source_path`` to the end of this document."""
+        """Append every page of ``source_path`` to the end (in memory until saved)."""
         if self._doc is None or self.path is None:
             raise RuntimeError("No document open")
         if os.path.abspath(source_path) == os.path.abspath(self.path):
             raise ValueError("Cannot append a document to itself")
-
-        def mutate(work: fitz.Document) -> None:
-            src = fitz.open(source_path)
-            try:
-                if src.needs_pass:
-                    raise ValueError("The PDF to append is password-protected")
-                work.insert_pdf(src)
-            finally:
-                src.close()
-
-        self._rewrite_in_place(mutate)
-
-    def _rewrite_in_place(self, mutate) -> None:
-        """Apply ``mutate(work)`` to a temp copy, then atomically replace the file.
-
-        Full rewrite to a fresh file (PyMuPDF refuses a non-incremental save back
-        onto the path it opened), so removed objects are actually dropped and the
-        file shrinks. A failure at any point leaves the original untouched.
-        """
-        if self._doc is None or self.path is None:
-            raise RuntimeError("No document open")
-        target = os.path.abspath(self.path)
-        directory = os.path.dirname(target) or "."
-        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=directory)
-        os.close(fd)
+        src = fitz.open(source_path)
         try:
-            work = fitz.open(target)
-            try:
-                mutate(work)
-                work.save(tmp_path, garbage=4, deflate=True)
-            finally:
-                work.close()
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
-
-        self._doc.close()
-        self._doc = None
-        try:
-            os.replace(tmp_path, target)
+            if src.needs_pass:
+                raise ValueError("The PDF to append is password-protected")
+            self._doc.insert_pdf(src)
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            self._doc = fitz.open(target)
-            self.path = target
-        # The page set changed: cached thumbnails are stale and any structure-aware
-        # view (the sidebar) needs to know to rebuild.
+            src.close()
+        self._pages_changed()
+
+    def _pages_changed(self) -> None:
+        """Record an unsaved change to the page set."""
+        self._modified = True
+        # Cached thumbnails are stale and any structure-aware view (the
+        # sidebar) needs to know to rebuild.
         self._thumb_cache.clear()
         self._structure_version += 1
 

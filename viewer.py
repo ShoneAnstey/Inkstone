@@ -306,7 +306,9 @@ class MainWindow(QMainWindow):
 
         self.act_save = QAction("Save", self)
         self.act_save.setShortcut(QKeySequence.Save)
-        self.act_save.triggered.connect(self.save_signed)
+        self.act_save.triggered.connect(self.save_document)
+        # Enabled only while the active document has unsaved changes.
+        self.act_save.setEnabled(False)
 
         self.act_save_as = QAction("Save As...", self)
         self.act_save_as.setShortcut(QKeySequence(Qt.CTRL | Qt.SHIFT | Qt.Key_S))
@@ -343,6 +345,7 @@ class MainWindow(QMainWindow):
         # Populated by _refresh_recent_ui() once the start page also exists.
 
         file_menu.addSeparator()
+        file_menu.addAction(self.act_save)
         file_menu.addAction(self.act_save_as)
         file_menu.addAction(self.act_append_pdf)
         file_menu.addAction(self.act_print)
@@ -434,17 +437,16 @@ class MainWindow(QMainWindow):
         sig_menu.addSeparator()
         sig_menu.addAction(self.act_rotate_sig_cw)
         sig_menu.addAction(self.act_rotate_sig_ccw)
-        sig_menu.addSeparator()
-        sig_menu.addAction(self.act_save)
         self._sig_menu = sig_menu
 
         sig_button = QToolButton(self)
         sig_button.setText("Signature")
-        sig_button.setToolTip("Set up, place, rotate, or save your signature")
+        sig_button.setToolTip("Set up, place, or rotate your signature")
         sig_button.setPopupMode(QToolButton.InstantPopup)
         sig_button.setMenu(sig_menu)
         toolbar.addWidget(sig_button)
 
+        toolbar.addAction(self.act_save)
         toolbar.addAction(self.act_save_as)
 
         # Apply tooltips that include the shortcut hint, e.g. "Find (Ctrl+F)".
@@ -561,6 +563,19 @@ class MainWindow(QMainWindow):
         if path:
             self.open_path(path)
 
+    def open_paths(self, paths: list[str]) -> None:
+        """Open each PDF in its own tab (a file that is already open is focused)."""
+        for path in paths:
+            self.open_path(path)
+
+    def bring_to_front(self) -> None:
+        """Surface the window, e.g. when another launch hands its files over."""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def open_path(self, path: str) -> None:
         # Normalise so the same file via different spellings (relative path,
         # drag-drop URL, recent entry) maps to one tab.
@@ -598,7 +613,7 @@ class MainWindow(QMainWindow):
             return
         widget = self.tabs.widget(index)
         if isinstance(widget, DocumentTab):
-            if not widget.ok_to_discard_annotations():
+            if not widget.confirm_close(config.get_signature_path()):
                 return
             widget.close_document()
         self.tabs.removeTab(index)
@@ -627,7 +642,7 @@ class MainWindow(QMainWindow):
             return
         if tab.add_signature(sig_path):
             self.statusBar().showMessage(
-                "Drag to position, drag the corner to resize, press R to rotate, then Sign & Save.",
+                "Drag to position, drag the corner to resize, press R to rotate, then Save (Ctrl+S).",
                 6000,
             )
 
@@ -638,7 +653,7 @@ class MainWindow(QMainWindow):
             return
         if tab.add_text():
             self.statusBar().showMessage(
-                "Type your text, drag to position, then Save.",
+                "Type your text, drag to position, then Save (Ctrl+S).",
                 5000,
             )
 
@@ -649,7 +664,7 @@ class MainWindow(QMainWindow):
             return
         if tab.add_highlight():
             self.statusBar().showMessage(
-                "Drag over the text, drag the corner to resize, Delete to remove, then Save.",
+                "Drag over the text, drag the corner to resize, Delete to remove, then Save (Ctrl+S).",
                 6000,
             )
 
@@ -681,7 +696,7 @@ class MainWindow(QMainWindow):
             return
         if tab.append_pdf(path):
             self.statusBar().showMessage(
-                f"Appended {os.path.basename(path)}.", 4000
+                f"Appended {os.path.basename(path)} — save to keep it (Ctrl+S).", 5000
             )
 
     def rotate_signature(self, delta_deg: int) -> None:
@@ -694,18 +709,17 @@ class MainWindow(QMainWindow):
                 4000,
             )
 
-    def save_signed(self) -> None:
+    def save_document(self) -> None:
+        """Save the active document's unsaved changes over its own file."""
         tab = self.current_tab()
         if tab is None:
             return
-        if not tab.has_annotations:
-            QMessageBox.information(
-                self, "No annotations",
-                "Add a signature, text, or highlight before saving.",
-            )
+        if not tab.modified:
+            self.statusBar().showMessage("No changes to save.", 3000)
             return
-        if tab.save_signed(config.get_signature_path()):
-            self.statusBar().showMessage("Saved.", 4000)
+        if tab.save(config.get_signature_path()):
+            self.statusBar().showMessage(f"Saved {tab.title}.", 4000)
+        self._update_status()
 
     def save_as_dialog(self) -> None:
         tab = self.current_tab()
@@ -768,7 +782,19 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("No document")
             self.setWindowTitle(f"Inkstone {version_string()}")
+        self.act_save.setEnabled(tab is not None and tab.modified)
+        self._update_tab_titles()
         self._update_zoom_page_widgets(tab)
+
+    def _update_tab_titles(self) -> None:
+        """Mark tabs that have unsaved changes with a leading dot."""
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            if not isinstance(widget, DocumentTab):
+                continue
+            text = f"\u25cf {widget.title}" if widget.modified else widget.title
+            if self.tabs.tabText(i) != text:
+                self.tabs.setTabText(i, text)
 
     def _update_zoom_page_widgets(self, tab: DocumentTab | None) -> None:
         """Sync the zoom-bar controls with the active tab.
@@ -831,12 +857,14 @@ class MainWindow(QMainWindow):
         app.setStyleSheet(_DARK_STYLESHEET if dark else "")
 
     def closeEvent(self, event) -> None:
-        # Warn before discarding any placed-but-unsaved annotations.
+        # Offer to save each document that has unsaved changes.
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
-            if isinstance(widget, DocumentTab) and not widget.ok_to_discard_annotations():
-                event.ignore()
-                return
+            if isinstance(widget, DocumentTab) and widget.modified:
+                self.tabs.setCurrentIndex(i)  # show which document is being asked about
+                if not widget.confirm_close(config.get_signature_path()):
+                    event.ignore()
+                    return
         config.set_window_geometry(self.saveGeometry())
         for i in range(self.tabs.count()):
             widget = self.tabs.widget(i)
