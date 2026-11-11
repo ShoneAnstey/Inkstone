@@ -1,8 +1,11 @@
 @echo off
-REM Build a portable Windows .exe for Inkstone.
+REM Build the Windows binaries for Inkstone in place (cmd).
+REM packaging\build_windows.ps1 does the same from a clean copy, works from
+REM WSL, and also builds the installer when Inno Setup is present.
 REM
 REM Run on Windows in a terminal (cmd). Requires Python 3.10+ on PATH.
-REM Output: dist\XPDF.exe  (portable, double-click to run)
+REM Output: dist\Inkstone\      (one-dir bundle, fastest startup)
+REM         dist\Inkstone.exe   (portable single file)
 
 setlocal
 set HERE=%~dp0
@@ -25,5 +28,5 @@ rmdir /s /q build 2>nul
 python -m PyInstaller --noconfirm "%ROOT%\packaging\inkstone.spec"
 
 echo.
-echo ^>^> Done: dist\XPDF.exe
+echo ^>^> Done: dist\Inkstone\Inkstone.exe and dist\Inkstone.exe
 endlocal

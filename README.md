@@ -15,8 +15,8 @@ Grab the latest release — no account, no installer wizard hassle:
 
 | Platform | Download |
 |----------|----------|
-| **Windows installer** (Desktop + Start Menu shortcuts) | [Inkstone-Setup.exe](https://github.com/ShoneAnstey/Inkstone/releases/latest/download/Inkstone-Setup.exe) |
-| **Windows portable** (no install, just run) | [Inkstone.exe](https://github.com/ShoneAnstey/Inkstone/releases/latest/download/Inkstone.exe) |
+| **Windows installer** (fastest startup; Desktop + Start Menu shortcuts) | [Inkstone-Setup.exe](https://github.com/ShoneAnstey/Inkstone/releases/latest/download/Inkstone-Setup.exe) |
+| **Windows portable** (single file, no install; unpacks itself on every launch, so it starts in seconds rather than instantly) | [Inkstone.exe](https://github.com/ShoneAnstey/Inkstone/releases/latest/download/Inkstone.exe) |
 | **Linux** (portable AppImage) | [Inkstone-x86_64.AppImage](https://github.com/ShoneAnstey/Inkstone/releases/latest/download/Inkstone-x86_64.AppImage) |
 
 All versions: [Releases page](https://github.com/ShoneAnstey/Inkstone/releases).
@@ -27,7 +27,10 @@ choose **More info → Run anyway**.
 
 ### Read & navigate
 - Open, page through, zoom, and fit-to-width
-- **Multiple tabs** — open many PDFs at once; drag tabs to reorder
+- **Multiple tabs, one window** — every PDF opens in its own tab; drag tabs to
+  reorder. Opening a PDF from the file manager while Inkstone is running adds
+  a tab to the window you already have (and brings it to the front) instead
+  of starting a second copy
 - **Continuous vertical scrolling** with crisp HiDPI rendering
 - **Sidebar** with page **thumbnails** and the document **outline / bookmarks** —
   click to jump (toggle with `F9`)
@@ -56,10 +59,18 @@ choose **More info → Run anyway**.
   **rotate it left/right**, or **delete it** from the document
 - **Append PDF** — File → Append PDF... merges another PDF onto the end of the
   open document
+- Nothing above touches the file until you save: annotations and page changes
+  alike are pending edits, shown by a dot on the tab
 
 ### Save
-- Saving overwrites the original file (atomic temp-file replace), or use
-  **Save As** (`Ctrl+Shift+S`) to write a copy
+- **Save** (`Ctrl+S`, File → Save, or the toolbar button) writes every pending
+  change over the file you opened. The new version is written beside it and
+  swapped in whole, so a failed save never leaves a half-written PDF
+- **Save As** (`Ctrl+Shift+S`) writes a copy and leaves the original alone
+- Closing a tab or the window with unsaved changes asks **Save / Discard /
+  Cancel**
+- If the file is read-only or open in another program, Inkstone says so and
+  keeps your changes so you can retry or Save As
 
 > This applies a **visual image** of your signature. It is not a cryptographic /
 > digital signature.
@@ -116,24 +127,38 @@ bash packaging/build_appimage.sh
 ```
 Needs internet on first run (downloads `appimagetool`).
 
-### Windows portable .exe (build on Windows)
-```bat
-packaging\build_windows.bat
-REM -> dist\Inkstone.exe   (portable, double-click)
+### Windows binaries
+PyInstaller cannot cross-compile, so this runs under Windows Python (3.12+), in
+its own virtual environment:
+
+```powershell
+# from Windows
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 ```
 
-### Windows installer (build on Windows)
-Build the `.exe` first, then compile the installer with Inno Setup:
-```bat
-iscc packaging\inkstone_installer.iss
-REM -> dist\Inkstone-Setup.exe   (creates Desktop + Start Menu shortcuts)
+```bash
+# from WSL
+powershell.exe -ExecutionPolicy Bypass -File "$(wslpath -w packaging/build_windows.ps1)" -Commit "$(git rev-parse HEAD)"
 ```
+
+It builds in `%LOCALAPPDATA%\Inkstone-build` (safe to delete) and produces:
+
+- `Inkstone\` — the one-dir bundle the installer installs. Nothing to unpack,
+  so it starts in well under half a second and a second launch hands its PDF
+  to the running window in about a quarter of a second.
+- `Inkstone.exe` — the portable single file. It is a self-extracting archive
+  that unpacks the Qt and PDF runtime to a temp folder on every launch, which
+  costs about three seconds each time.
+- `Inkstone-Setup.exe` — the installer, if Inno Setup is installed.
+
+`packaging\build_windows.bat` does the PyInstaller step in place from `cmd`.
 
 ## Files
 - `main.py` — entry point, app icon
+- `single_instance.py` — one window per user: later launches hand their PDFs to it
 - `viewer.py` — main window: tab host, toolbar, menus, sidebar, dark mode, navigation
 - `document_tab.py` — one open PDF per tab: render, navigate, zoom, sign, text, find, page surgery
-- `pdf_document.py` — PyMuPDF wrapper: render pages, thumbnails, outline, stamp/save, extract/delete pages
+- `pdf_document.py` — PyMuPDF wrapper: render pages, thumbnails, outline, pending page changes, stamp/save, extract pages
 - `sidebar.py` — page thumbnails + outline navigation panel
 - `signature_item.py` — draggable / resizable / rotatable signature overlay
 - `text_item.py` — draggable typewriter text overlay

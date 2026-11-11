@@ -1,9 +1,12 @@
 ; Inno Setup script for Inkstone.
 ;
-; Compiles a Windows installer that installs the portable Inkstone.exe and creates
-; Start Menu + Desktop shortcuts (with the app icon) plus an uninstaller.
+; Compiles a Windows installer that installs the one-dir Inkstone bundle
+; (Inkstone.exe plus its _internal runtime folder) and creates Start Menu +
+; Desktop shortcuts (with the app icon) plus an uninstaller. The one-dir build
+; starts much faster than the portable single-file exe, which has to unpack
+; itself to a temp folder on every launch.
 ;
-; Expects the PyInstaller build to have produced dist\Inkstone.exe first.
+; Expects the PyInstaller build to have produced dist\Inkstone\ first.
 ; Compile on Windows with: iscc packaging\inkstone_installer.iss
 ; Output: dist\Inkstone-Setup.exe
 
@@ -40,9 +43,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "associate"; Description: "Register Inkstone as a PDF reader (then set it as default in Windows Settings)"; GroupDescription: "File associations:"; Flags: checkedonce
 
 [Files]
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\Inkstone\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
+; Clear the previous version's runtime so files it no longer ships don't linger.
+Type: filesandordirs; Name: "{app}\_internal"
 ; Leftovers from when this app was named XPDF. The AppId is unchanged, so
 ; this installer upgrades old installs in place — clean up the old exe and
 ; shortcuts that would otherwise linger beside the renamed ones.

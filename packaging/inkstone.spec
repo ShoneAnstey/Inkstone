@@ -3,8 +3,17 @@
 # Build (run on the TARGET OS — PyInstaller does not cross-compile):
 #   pyinstaller pdf/packaging/inkstone.spec
 #
-# Windows  -> dist/Inkstone.exe   (portable, double-click to run)
-# Linux    -> dist/Inkstone/      (one-dir bundle, wrapped into an AppImage)
+# Windows  -> dist/Inkstone/      (one-dir bundle, what the installer installs)
+#             dist/Inkstone.exe   (portable single file, double-click to run)
+# Linux    -> dist/Inkstone/      (one-dir bundle, wrapped into an AppImage / .deb)
+#
+# Why two Windows builds: a one-file exe is a self-extracting archive. Every
+# launch unpacks the whole Qt + PDF runtime to a temp folder (and the virus
+# scanner reads it all again) before a line of Python runs — that, not the
+# app, is what makes startup slow, and it happens even when the launch only
+# hands a PDF to an already-running window. The one-dir bundle has nothing to
+# unpack, so the installed app starts from its own folder. The single file is
+# kept for people who want one thing to download and run.
 #
 # On Windows the icon is icon.ico; on Linux PyInstaller ignores .ico so we pass None.
 
@@ -53,8 +62,8 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 if is_windows:
-    # One-file portable .exe on Windows.
-    exe = EXE(
+    # One-file portable .exe -> dist/Inkstone.exe
+    portable = EXE(
         pyz,
         a.scripts,
         a.binaries,
@@ -70,27 +79,27 @@ if is_windows:
         console=False,
         icon=icon,
     )
-else:
-    # One-dir bundle on Linux (gets wrapped into an AppImage).
-    exe = EXE(
-        pyz,
-        a.scripts,
-        [],
-        exclude_binaries=True,
-        name="Inkstone",
-        debug=False,
-        bootloader_ignore_signals=False,
-        strip=False,
-        upx=False,
-        console=False,
-        icon=icon,
-    )
-    coll = COLLECT(
-        exe,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
-        strip=False,
-        upx=False,
-        name="Inkstone",
-    )
+
+# One-dir bundle -> dist/Inkstone/ (Windows installer payload; Linux AppImage / .deb).
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="Inkstone",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    icon=icon,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="Inkstone",
+)
