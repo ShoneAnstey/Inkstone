@@ -10,7 +10,7 @@ to any Python project (web or desktop):
     Layer 3 — Static Security     (Bandit + Semgrep)
     Layer 4 — Dependency Integrity(pip-audit, only when requirements*.txt staged)
     Layer 5 — Secret Protection   (detect-secrets + gitleaks)
-    Layer 6 — AI Logic Validation (Gemini diff review — security_diff_review.py)
+    Layer 6 — AI Logic Validation (Astra or Claude Opus diff review — security_diff_review.py)
 
 Every tool is optional: if it isn't installed the layer warns and is skipped,
 so you can adopt the gate incrementally.
@@ -66,15 +66,6 @@ _PREFIX_BIN = Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin")
 VENV_BIN = ROOT / ".venv" / "bin"
 _BIN_DIRS = [_INTERP_BIN, _PREFIX_BIN, VENV_BIN]
 VENV_PYTHON = VENV_BIN / "python"
-
-# Load .env so API keys (GEMINI_API_KEY, etc.) are available to Layer 6.
-_dotenv = ROOT / ".env"
-if _dotenv.exists():
-    for _line in _dotenv.read_text().splitlines():
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _key, _, _val = _line.partition("=")
-            os.environ.setdefault(_key.strip(), _val.strip())
 
 # ── Colours ──────────────────────────────────────────────────────
 
@@ -347,8 +338,24 @@ def layer_5_secrets() -> bool:
     return ok
 
 
+# Layer 6's reviewer, by the rule security_diff_review.py applies:
+# SECURITY_DIFF_REVIEWERS (astra or claude) when set; otherwise astra when
+# CLAUDECODE is set (Claude Code sets it for the commands it runs); otherwise claude.
+AI_REVIEWER_NAMES = {"astra": "Astra", "claude": "Claude Opus"}
+# security_diff_review.py stops its reviewer call after 150 s.
+AI_REVIEW_TIMEOUT_S = 180
+
+
+def _ai_reviewer() -> str:
+    chosen = os.environ.get("SECURITY_DIFF_REVIEWERS", "").strip().lower()
+    if chosen:
+        return chosen
+    return "astra" if os.environ.get("CLAUDECODE") else "claude"
+
+
 def layer_6_ai_review() -> bool:
-    _banner(6, "AI Logic Validation (Gemini)")
+    reviewer = _ai_reviewer()
+    _banner(6, f"AI Logic Validation ({AI_REVIEWER_NAMES.get(reviewer, reviewer)})")
     # Prefer a copy alongside this toolkit; fall back to one in the repo.
     review_script = None
     for base in (TOOLKIT_DIR, ROOT / "security", ROOT / "utils"):
@@ -367,9 +374,9 @@ def layer_6_ai_review() -> bool:
         return True
 
     try:
-        result = _run([_python(), str(review_script)], timeout=30)
+        result = _run([_python(), str(review_script)], timeout=AI_REVIEW_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        _warn("AI review timed out (30 s) — skipping")
+        _warn(f"AI review timed out ({AI_REVIEW_TIMEOUT_S} s) — skipping")
         return True
 
     if result.returncode == 0:
